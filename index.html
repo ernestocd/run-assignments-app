@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Run Assignments</title>
+  <link rel="stylesheet" href="https://js.arcgis.com/4.30/esri/themes/light/main.css">
+  <script src="https://js.arcgis.com/4.30/"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui; margin: 0; }
+    #app { padding: 16px; max-width: 900px; margin: 0 auto; }
+    select { width: 100%; height: 260px; }
+    button { padding: 8px 14px; margin-top: 8px; }
+    #log { white-space: pre-wrap; background:#fafafa; border:1px solid #ddd; padding:8px; margin-top:12px;}
+  </style>
+</head>
+<body>
+<div id="app">
+  <h2>Workforce Assignments</h2>
+  <p>Select zones and click Run.</p>
+  <label>Zones</label>
+  <select id="zones" multiple></select>
+  <div>
+    <label><input type="checkbox" id="dryrun" checked> Dry run (don’t push)</label>
+  </div>
+  <button id="run">Run</button>
+  <div id="status"></div>
+  <div id="log"></div>
+</div>
+
+<script>
+require([
+  "esri/request",
+  "esri/identity/IdentityManager",
+  "esri/identity/OAuthInfo"
+], (esriRequest, idManager, OAuthInfo) => {
+
+  // ---- CONFIG ----
+  const portalUrl = "https://vcu.prvectorcontrol.org/portal";
+  const zonesFL = "https://vcu.prvectorcontrol.org/server/rest/services/Hosted/VCU_Zones/FeatureServer/0";
+  const gpUrl   = "https://vcu.prvectorcontrol.org/server/rest/services/PRVCU_AssignToWorkers/Run_Assignments/GPServer/Run Assignments";
+
+  // ---- OAuth (recommended). If you already have a token via Portal session, you can skip this and rely on web-tier auth. ----
+  // const info = new OAuthInfo({ appId: "<your-portal-appid>", portalUrl, popup: true });
+  // idManager.registerOAuthInfos([info]);
+
+  const $zones = document.getElementById("zones");
+  const $run = document.getElementById("run");
+  const $dry = document.getElementById("dryrun");
+  const $status = document.getElementById("status");
+  const $log = document.getElementById("log");
+
+  function setStatus(msg){ $status.textContent = msg; }
+  function setLog(msg){ $log.textContent = msg; }
+
+  // Load zones (unique values from the feature layer)
+  esriRequest(zonesFL + "/query", {
+    query: {
+      where: "1=1",
+      outFields: "zones",
+      returnGeometry: false,
+      f: "json"
+    },
+    responseType: "json"
+  }).then(resp => {
+    const feats = resp.data.features || [];
+    const vals = [...new Set(feats.map(f => (f.attributes?.zones || "").trim()).filter(Boolean))]
+      .sort((a,b)=> a.localeCompare(b,undefined,{numeric:true}));
+    vals.forEach(z => {
+      const opt = document.createElement("option");
+      opt.value = z; opt.textContent = z;
+      $zones.appendChild(opt);
+    });
+  }).catch(err => setLog("Failed to load zones: " + (err.message || err)));
+
+  // Run GP
+  $run.onclick = () => {
+    const selected = [...$zones.selectedOptions].map(o => o.value);
+    if (selected.length === 0) { setStatus("Pick at least one zone."); return; }
+
+    setStatus("Submitting job...");
+    setLog("");
+
+    // Submit job (async)
+    esriRequest(gpUrl + "/submitJob", {
+      method: "post",
+      query: {
+        f: "json",
+        Zones: JSON.stringify(selected),   // matches our GP String param
+        Dry_Run: $dry.checked ? "true" : "false"
+      },
+      responseType: "json"
+    }).then(r => {
+      const jobId = r.data.jobId;
+      setStatus("Job submitted: " + jobId);
+      poll(jobId);
+    }).catch(err => setLog("Submit failed: " + (err.message || err)));
+  };
+
+  // Poll job status
+  function poll(jobId){
+    esriRequest(gpUrl + "/jobs/" + jobId, {
+      query: { f: "json" },
+      responseType: "json"
+    }).then(r => {
+      const s = r.data.jobStatus;
+      setStatus("Status: " + s);
+      if (s === "esriJobSucceeded") {
+        // Fetch results (Log and Assignment Count)
+        Promise.all([
+          esriRequest(`${gpUrl}/jobs/${jobId}/results/Assignment_Count`, { query: { f:"json" }, responseType: "json" }),
+          esriRequest(`${gpUrl}/jobs/${jobId}/results/Log`, { query: { f:"json" }, responseType: "json" })
+        ]).then(([countRes, logRes]) => {
+          const countVal = countRes.data?.value ?? "(n/a)";
+          const logVal = logRes.data?.value ?? "";
+          setStatus("Success. Assignments: " + countVal);
+          setLog(logVal);
+        });
+      } else if (s === "esriJobFailed") {
+        setStatus("Job failed.");
+        setLog(JSON.stringify(r.data, null, 2));
+      } else {
+        setTimeout(()=>poll(jobId), 1200);
+      }
+    }).catch(err => setLog("Status error: " + (err.message || err)));
+  }
+
+});
+</script>
+</body>
+</html>
