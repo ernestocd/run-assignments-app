@@ -10,19 +10,30 @@
     #app { padding: 16px; max-width: 900px; margin: 0 auto; }
     select { width: 100%; height: 260px; }
     button { padding: 8px 14px; margin-top: 8px; }
+    #status { margin-top: 8px; }
     #log { white-space: pre-wrap; background:#fafafa; border:1px solid #ddd; padding:8px; margin-top:12px;}
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:8px; }
   </style>
 </head>
 <body>
 <div id="app">
   <h2>Workforce Assignments</h2>
-  <p>Select zones and click Run.</p>
+  <p>Select zones, optionally edit them, then click Run.</p>
+
   <label>Zones</label>
   <select id="zones" multiple></select>
-  <div>
-    <label><input type="checkbox" id="dryrun" checked> Dry run (don’t push)</label>
+
+  <div class="row">
+    <button id="addZone"    type="button">Add</button>
+    <button id="renameZone" type="button">Rename</button>
+    <button id="deleteZone" type="button">Delete</button>
   </div>
-  <button id="run">Run</button>
+
+  <div class="row">
+    <label><input type="checkbox" id="dryrun" checked> Dry run (don’t push)</label>
+    <button id="run">Run</button>
+  </div>
+
   <div id="status"></div>
   <div id="log"></div>
 </div>
@@ -30,100 +41,189 @@
 <script>
 require([
   "esri/request",
+  "esri/config",
   "esri/identity/IdentityManager",
-  "esri/identity/OAuthInfo"
-], (esriRequest, idManager, OAuthInfo) => {
+  "esri/identity/OAuthInfo",
+  "esri/layers/FeatureLayer"
+], (esriRequest, esriConfig, esriId, OAuthInfo, FeatureLayer) => {
 
-  // ---- CONFIG ----
-  const portalUrl = "https://vcu.prvectorcontrol.org/portal";
-  const zonesFL = "https://vcu.prvectorcontrol.org/server/rest/services/Hosted/VCU_Zones/FeatureServer/0";
-  const gpUrl   = "https://vcu.prvectorcontrol.org/server/rest/services/PRVCU_AssignToWorkers/Run_Assignments/GPServer/Run Assignments";
+  // ---------- CONFIG (edit only these if needed) ----------
+  const portalUrl   = "https://vcu.prvectorcontrol.org/portal"; // keep /portal
+  const zonesFL     = "https://vcu.prvectorcontrol.org/server/rest/services/Hosted/VCU_Zones/FeatureServer/0";
+  const gpUrl       = "https://vcu.prvectorcontrol.org/server/rest/services/PRVCU_AssignToWorkers/Run_Assignments/GPServer/Run%20Assignments";
+  const appId       = "cF6fCVFvxCqEhA0D";                         // your Portal OAuth Client ID
+  const redirectUri = "https://vcu.prvectorcontrol.org/RunAssignments/index.html"; // must match OAuth item
 
-  // ---- OAuth (recommended). If you already have a token via Portal session, you can skip this and rely on web-tier auth. ----
-  // const info = new OAuthInfo({ appId: "<your-portal-appid>", portalUrl, popup: true });
-  // idManager.registerOAuthInfos([info]);
+  // ---------- ArcGIS JS plumbing ----------
+  esriConfig.portalUrl = portalUrl;
+  esriConfig.request.trustedServers.push("https://vcu.prvectorcontrol.org");
+  esriConfig.request.timeout = 60000;
 
-  const $zones = document.getElementById("zones");
-  const $run = document.getElementById("run");
-  const $dry = document.getElementById("dryrun");
+  esriId.registerOAuthInfos([ new OAuthInfo({
+    appId, portalUrl, popup:false, flowType:"authorization-code", redirectUri
+  })]);
+
+  const zonesLayer = new FeatureLayer({ url: zonesFL });
+  let currentZones = []; // cache
+
+  // ---------- DOM ----------
+  const $zones  = document.getElementById("zones");
+  const $run    = document.getElementById("run");
+  const $dry    = document.getElementById("dryrun");
   const $status = document.getElementById("status");
-  const $log = document.getElementById("log");
+  const $log    = document.getElementById("log");
+  const $btnAdd    = document.getElementById("addZone");
+  const $btnRename = document.getElementById("renameZone");
+  const $btnDelete = document.getElementById("deleteZone");
 
-  function setStatus(msg){ $status.textContent = msg; }
-  function setLog(msg){ $log.textContent = msg; }
+  const showStatus = (m) => $status.textContent = m || "";
+  const showLog    = (m) => $log.textContent = typeof m === "string" ? m : JSON.stringify(m, null, 2);
+  const normalize  = (s) => (s || "").trim();
+  const escapeSql  = (s) => (s || "").replace(/'/g, "''");
 
-  // Load zones (unique values from the feature layer)
-  esriRequest(zonesFL + "/query", {
-    query: {
-      where: "1=1",
-      outFields: "zones",
-      returnGeometry: false,
-      f: "json"
-    },
-    responseType: "json"
-  }).then(resp => {
-    const feats = resp.data.features || [];
-    const vals = [...new Set(feats.map(f => (f.attributes?.zones || "").trim()).filter(Boolean))]
-      .sort((a,b)=> a.localeCompare(b,undefined,{numeric:true}));
-    vals.forEach(z => {
-      const opt = document.createElement("option");
-      opt.value = z; opt.textContent = z;
-      $zones.appendChild(opt);
-    });
-  }).catch(err => setLog("Failed to load zones: " + (err.message || err)));
+  // ---------- Boot ----------
+  esriId.checkSignInStatus(portalUrl + "/sharing")
+    .catch(() => esriId.getCredential(portalUrl + "/sharing"))
+    .then(init)
+    .catch(err => showLog("Auth error: " + (err?.message || err)));
 
-  // Run GP
-  $run.onclick = () => {
-    const selected = [...$zones.selectedOptions].map(o => o.value);
-    if (selected.length === 0) { setStatus("Pick at least one zone."); return; }
+  async function init(){
+    try { await reloadZones(); } catch(e){ showLog(e); }
 
-    setStatus("Submitting job...");
-    setLog("");
+    // ---- CRUD: Add ----
+    $btnAdd.onclick = async () => {
+      const name = prompt("New zone name:");
+      const zone = normalize(name);
+      if (!zone) return;
 
-    // Submit job (async)
-    esriRequest(gpUrl + "/submitJob", {
-      method: "post",
-      query: {
-        f: "json",
-        Zones: JSON.stringify(selected),   // matches our GP String param
-        Dry_Run: $dry.checked ? "true" : "false"
-      },
-      responseType: "json"
-    }).then(r => {
-      const jobId = r.data.jobId;
-      setStatus("Job submitted: " + jobId);
-      poll(jobId);
-    }).catch(err => setLog("Submit failed: " + (err.message || err)));
-  };
-
-  // Poll job status
-  function poll(jobId){
-    esriRequest(gpUrl + "/jobs/" + jobId, {
-      query: { f: "json" },
-      responseType: "json"
-    }).then(r => {
-      const s = r.data.jobStatus;
-      setStatus("Status: " + s);
-      if (s === "esriJobSucceeded") {
-        // Fetch results (Log and Assignment Count)
-        Promise.all([
-          esriRequest(`${gpUrl}/jobs/${jobId}/results/Assignment_Count`, { query: { f:"json" }, responseType: "json" }),
-          esriRequest(`${gpUrl}/jobs/${jobId}/results/Log`, { query: { f:"json" }, responseType: "json" })
-        ]).then(([countRes, logRes]) => {
-          const countVal = countRes.data?.value ?? "(n/a)";
-          const logVal = logRes.data?.value ?? "";
-          setStatus("Success. Assignments: " + countVal);
-          setLog(logVal);
-        });
-      } else if (s === "esriJobFailed") {
-        setStatus("Job failed.");
-        setLog(JSON.stringify(r.data, null, 2));
-      } else {
-        setTimeout(()=>poll(jobId), 1200);
+      if (currentZones.includes(zone)) {
+        return showStatus(`Zone "${zone}" already exists.`);
       }
-    }).catch(err => setLog("Status error: " + (err.message || err)));
+      try {
+        const res = await zonesLayer.applyEdits({ addFeatures: [{ attributes: { zones: zone } }] });
+        if (res.addFeatureResults?.[0]?.success) {
+          showStatus(`Added "${zone}".`);
+          await reloadZones(zone);
+        } else { showLog(res); }
+      } catch (e) { showLog(e); }
+    };
+
+    // ---- CRUD: Rename (single select) ----
+    $btnRename.onclick = async () => {
+      const sel = [...$zones.selectedOptions].map(o => o.value);
+      if (sel.length !== 1) return showStatus("Pick exactly one zone to rename.");
+      const oldName = sel[0];
+      const newName = normalize(prompt(`New name for "${oldName}":`, oldName));
+      if (!newName || newName === oldName) return;
+      if (currentZones.includes(newName)) return showStatus(`Zone "${newName}" already exists.`);
+
+      try {
+        const q = await zonesLayer.queryFeatures({
+          where: `zones='${escapeSql(oldName)}'`,
+          outFields: ["objectid","zones"],
+          returnGeometry: false
+        });
+        if (!q.features?.length) return showStatus("Could not find selected zone.");
+        q.features.forEach(f => f.attributes.zones = newName);
+        const res = await zonesLayer.applyEdits({ updateFeatures: q.features });
+        if (res.updateFeatureResults?.every(r => r.success)) {
+          showStatus(`Renamed "${oldName}" to "${newName}".`);
+          await reloadZones(newName);
+        } else { showLog(res); }
+      } catch (e) { showLog(e); }
+    };
+
+    // ---- CRUD: Delete (multi-select) ----
+    $btnDelete.onclick = async () => {
+      const sel = [...$zones.selectedOptions].map(o => o.value);
+      if (!sel.length) return showStatus("Pick one or more zones to delete.");
+      if (!confirm(`Delete ${sel.length} zone(s)?`)) return;
+
+      try {
+        const where = sel.map(z => `zones='${escapeSql(z)}'`).join(" OR ");
+        const q = await zonesLayer.queryFeatures({
+          where, outFields: ["objectid"], returnGeometry: false
+        });
+        const ids = q.features.map(f => f.attributes.objectid);
+        if (!ids.length) return showStatus("Nothing to delete.");
+
+        const res = await zonesLayer.applyEdits({
+          deleteFeatures: ids.map(id => ({ objectId: id }))
+        });
+        if (res.deleteFeatureResults?.every(r => r.success)) {
+          showStatus(`Deleted ${ids.length} record(s).`);
+          await reloadZones();
+        } else { showLog(res); }
+      } catch (e) { showLog(e); }
+    };
+
+    // ---- Run GP ----
+    $run.onclick = () => {
+      const selected = [...$zones.selectedOptions].map(o => o.value);
+      if (!selected.length) return showStatus("Pick at least one zone.");
+      showStatus("Submitting job...");
+      showLog("");
+
+      esriRequest(gpUrl + "/submitJob", {
+        method: "post",
+        query: { f:"json", Zones: JSON.stringify(selected), Dry_Run: $dry.checked ? "true" : "false" },
+        responseType: "json"
+      })
+      .then(r => {
+        const jobId = r.data?.jobId;
+        if (!jobId) throw new Error("No jobId returned.");
+        showStatus("Job submitted: " + jobId);
+        poll(jobId);
+      })
+      .catch(err => showLog("Submit failed: " + (err.message || err)));
+    };
   }
 
+  // ---------- Helpers ----------
+  async function reloadZones(selectValue){
+    const resp = await esriRequest(zonesFL + "/query", {
+      query: { where:"1=1", outFields:"zones", returnGeometry:false, f:"json" },
+      responseType: "json"
+    });
+    const feats = resp.data?.features ?? [];
+    currentZones = [...new Set(feats.map(f => normalize(f.attributes?.zones)).filter(Boolean))]
+      .sort((a,b)=> a.localeCompare(b, undefined, { numeric:true, sensitivity:"base" }));
+
+    $zones.innerHTML = "";
+    currentZones.forEach(z => {
+      const opt = document.createElement("option");
+      opt.value = z; opt.textContent = z;
+      if (selectValue && z === selectValue) opt.selected = true;
+      $zones.appendChild(opt);
+    });
+    showStatus(`Loaded ${currentZones.length} zone(s).`);
+  }
+
+  function poll(jobId){
+    esriRequest(`${gpUrl}/jobs/${jobId}`, { query:{ f:"json" }, responseType:"json" })
+    .then(r => {
+      const s = r.data?.jobStatus;
+      showStatus("Status: " + s);
+      if (s === "esriJobSucceeded") {
+        Promise.all([
+          esriRequest(`${gpUrl}/jobs/${jobId}/results/Assignment_Count`, { query:{ f:"json" }, responseType:"json" }),
+          esriRequest(`${gpUrl}/jobs/${jobId}/results/Log`,              { query:{ f:"json" }, responseType:"json" })
+        ])
+        .then(([countRes, logRes]) => {
+          const countVal = countRes.data?.value ?? "(n/a)";
+          const logVal   = logRes.data?.value ?? "";
+          showStatus("Success. Assignments: " + countVal);
+          showLog(logVal || "Done.");
+        })
+        .catch(err => showLog("Result fetch error: " + (err.message || err)));
+      } else if (s === "esriJobFailed") {
+        showStatus("Job failed."); showLog(r.data);
+      } else {
+        setTimeout(() => poll(jobId), 1200);
+      }
+    })
+    .catch(err => showLog("Status error: " + (err.message || err)));
+  }
 });
 </script>
 </body>
